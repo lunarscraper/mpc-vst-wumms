@@ -1,0 +1,19 @@
+{
+  "_comment": "Not a real Schwung module -- chain_params lists the VST parameters of wumms_vst.cpp so mpc-vst-plugins' tools/gen_vst.py can generate params.h + the skin. Keys must match wumms_vst.cpp (KEYS[]). Start values the plugin sets itself (start_values()). Only append, never reorder; projects and presets restore by key.",
+  "chain_params": [
+    {"key": "gain", "name": "In Gain", "min": -12, "max": 24},
+    {"key": "comp", "name": "Comp", "min": 0, "max": 100},
+    {"key": "attack", "name": "Attack", "min": 0, "max": 100},
+    {"key": "release", "name": "Release", "min": 0, "max": 100},
+    {"key": "drive", "name": "Drive", "min": 0, "max": 100},
+    {"key": "disto", "name": "Disto", "options": ["BOOST", "TUBE", "FUZZ", "SQUARE"]},
+    {"key": "mix", "name": "Mix", "min": 0, "max": 100},
+    {"key": "level", "name": "Level", "min": -24, "max": 12},
+    {"key": "locut", "name": "Lo Cut", "options": ["OFF", "75 HZ", "150 HZ", "300 HZ"]},
+    {"key": "hicut", "name": "Hi Cut", "min": 0, "max": 100},
+    {"key": "gate", "name": "Gate", "options": ["OFF", "-50 DB", "-40 DB", "-30 DB", "-20 DB", "-10 DB", "0 DB"]},
+    {"key": "slot", "name": "Preset", "min": 1, "max": 32},
+    {"key": "load", "name": "Load", "access": "write"},
+    {"key": "save", "name": "Save", "access": "write"}
+  ]
+}
