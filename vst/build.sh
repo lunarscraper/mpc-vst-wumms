@@ -3,7 +3,7 @@
 #   vst/build/wumms.so            -> /sdcard/vst/ on the device
 #   vst/build/pluginlist-entry.xml  the <PLUGIN> line for MPC.settings' pluginList-arm
 #   vst/build/skin/                 -> /sdcard/Synths/ on the device
-# wumms_vst.cpp + the DSP core wumms_core.h, no dependencies. vst.json/module.json only feed
+# wumms_vst.cpp + the DSP core wumms_core.h + the MASTER page wumms_master.h, no dependencies. vst.json/module.json only feed
 # tools/gen_vst.py for params.h + the skin. Offline test + benchmark: test.sh.
 set -euo pipefail
 cd "$(dirname "$0")"

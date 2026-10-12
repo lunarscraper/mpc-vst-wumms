@@ -4,7 +4,9 @@
  * for each distortion type, MIX (0 = dry, parallel mixing without comb filtering), channel
  * independence, the 32 preset slots (program list, factory settings, SAVE/LOAD, shared bank file),
  * loud input below 0 dBFS, chunk restore, a random stress run at three sample rates, NaN/denormal-
- * free output. With "bench" as the second argument it only measures CPU load. PASSED/FAILED. */
+ * free output; the MASTER page: neutral when on, the limiter's ceiling (sample and true peak, also on
+ * a sudden burst), both shelves, mono bass, width, release, the loudness and limiter readouts, the
+ * master presets, switching off again. With "bench" as the second argument it only measures CPU load. PASSED/FAILED. */
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -57,6 +59,11 @@ static void set(AEffect *e, const char *name, double v) {
     else if (s == "Gate") { hi = 6; }
     else if (s == "Load" || s == "Save") { hi = 1; }
     else if (s == "Preset") { lo = 1; hi = 32; }
+    else if (s == "Low" || s == "High") { lo = -6; hi = 6; }
+    else if (s == "Width") { hi = 200; }
+    else if (s == "Push") { hi = 12; }
+    else if (s == "Ceiling") { lo = -6; hi = -0.1; }
+    else if (s == "Master") { hi = 1; }
     e->setParameter(e, param(e, name), (float)((v - lo) / (hi - lo)));
 }
 static void press(AEffect *e, const char *name) { set(e, name, 1); set(e, name, 0); }
@@ -124,7 +131,28 @@ static double diff_delayed(const Buf &out, const Buf &in, int delay, double t0 =
 static void neutral(AEffect *e) {
     set(e, "In Gain", 0); set(e, "Comp", 0); set(e, "Attack", 60); set(e, "Release", 45); set(e, "Drive", 0);
     set(e, "Disto", 0); set(e, "Mix", 100); set(e, "Level", 0); set(e, "Lo Cut", 0); set(e, "Hi Cut", 100); set(e, "Gate", 0);
+    set(e, "Master", 0); set(e, "Low", 0); set(e, "High", 0); set(e, "Mono Bass", 0); set(e, "Width", 100); set(e, "Push", 0);
+    set(e, "Ceiling", -1); set(e, "Lim Release", 0);
 }
+/* true peak of a buffer: 8x reconstruction with a long windowed sinc */
+static double true_peak(const Buf &a, double t0) {
+    const int OS = 8, HT = 32;
+    double p = 0;
+    for (size_t i = (size_t)(t0 * SR) + HT; i + HT < a.size(); i++)
+        for (int f = 0; f < OS; f++) {
+            const double fr = (double)f / OS;
+            double v = 0;
+            for (int k = -HT + 1; k <= HT; k++) {
+                const double t = k - fr;
+                const double sx = std::fabs(t) < 1e-12 ? 1.0 : std::sin(M_PI * t) / (M_PI * t);
+                const double w = 0.5 + 0.5 * std::cos(M_PI * t / (HT + 1));
+                v += a[i + k] * sx * w;
+            }
+            p = std::max(p, std::fabs(v));
+        }
+    return p;
+}
+static double num(const std::string &s) { const char *c = s.c_str(); while (*c && !(*c == '-' || (*c >= '0' && *c <= '9'))) c++; return std::atof(c); }
 
 int main(int argc, char **argv) {
     if (argc < 2) { std::printf("usage: host_test plugin.so [bench]\n"); return 2; }
@@ -145,6 +173,7 @@ int main(int argc, char **argv) {
     if (argc > 2 && !std::strcmp(argv[2], "bench")) {
         set(e, "In Gain", 6); set(e, "Comp", 40); set(e, "Drive", 60); set(e, "Disto", 1); set(e, "Lo Cut", 1);
         set(e, "Hi Cut", 80); set(e, "Gate", 2); set(e, "Mix", 70);
+        set(e, "Master", 1); set(e, "Low", 2); set(e, "High", 1.5); set(e, "Mono Bass", 60); set(e, "Width", 120); set(e, "Push", 8);
         auto t0 = std::chrono::steady_clock::now();
         run(e, 110, 0.3, 10.0);
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -304,12 +333,22 @@ int main(int argc, char **argv) {
         CHECK(e->numPrograms == 32, "numPrograms %d", e->numPrograms);
         CHECK(progname(e, 0) == "CLEAN" && progname(e, 1) == "MASTER GLUE" && progname(e, 31) == "32 (empty)", "program names: %s / %s / %s",
               progname(e, 0).c_str(), progname(e, 1).c_str(), progname(e, 31).c_str());
-        for (int i = 0; i < 16; i++) {
+        CHECK(progname(e, 16) == "MASTER SAFE" && progname(e, 23) == "LIVE CLUB" && progname(e, 24) == "25 (empty)", "master preset names: %s / %s / %s",
+              progname(e, 16).c_str(), progname(e, 23).c_str(), progname(e, 24).c_str());
+        for (int i = 0; i < 24; i++) {
             e->dispatcher(e, 2, 0, i, nullptr, 0);
             silence(e, 0.3);
             Buf a = run(e, 110, 0.25, 1.5);
-            std::printf("  preset %-15s -15 dBFS in -> %6.1f dBFS out, peak %.3f\n", progname(e, i).c_str(), db(rms(a, 0.8)), peak(a));
-            CHECK(rms(a, 0.8) > 0.02 && rms(a, 0.8) < 0.6 && peak(a) <= 0.991, "preset %s silent or too hot", progname(e, i).c_str());
+            const bool m = display(e, "Master") == "ON";
+            const double ceil = std::pow(10.0, num(display(e, "Ceiling")) / 20.0);
+            std::printf("  preset %-15s -15 dBFS in -> %6.1f dBFS out, peak %.3f%s\n", progname(e, i).c_str(), db(rms(a, 0.8)), peak(a),
+                        m ? (" (master, ceiling " + display(e, "Ceiling") + ", " + display(e, "Gain Red") + ")").c_str() : "");
+            CHECK(rms(a, 0.8) > 0.02 && rms(a, 0.8) < (m ? 0.8 : 0.6) && peak(a) <= 0.991, "preset %s silent or too hot", progname(e, i).c_str());
+            CHECK(m == (i >= 16), "preset %s: master %s", progname(e, i).c_str(), display(e, "Master").c_str());
+            if (m) {   /* and with a hot input: never above the ceiling */
+                Buf b = run(e, 110, 0.9, 1.0);
+                CHECK(peak(b, 0.1) <= ceil * 1.0005, "preset %s above its ceiling (%.4f > %.4f)", progname(e, i).c_str(), peak(b, 0.1), ceil);
+            }
             CHECK(e->dispatcher(e, 3, 0, 0, nullptr, 0) == i, "effGetProgram");
         }
         /* slot 1 is the start setting */
@@ -358,6 +397,7 @@ int main(int argc, char **argv) {
     /* 11. chunk */
     neutral(e);
     set(e, "Disto", 2); set(e, "Lo Cut", 1); set(e, "Gate", 4); set(e, "Level", -4); set(e, "Hi Cut", 43.21); set(e, "Preset", 5);
+    set(e, "Master", 1); set(e, "Low", 2.5); set(e, "Mono Bass", 60); set(e, "Ceiling", -2); set(e, "Lim Release", 50);
     {
         void *chunk = nullptr;
         intptr_t len = e->dispatcher(e, 23, 0, 0, &chunk, 0);
@@ -365,12 +405,117 @@ int main(int argc, char **argv) {
         AEffect *e2 = mainf(master);
         e2->dispatcher(e2, 10, 0, 0, nullptr, SR);
         e2->dispatcher(e2, 24, 0, (intptr_t)copy.size(), copy.data(), 0);
-        for (const char *k : {"Disto", "Lo Cut", "Gate", "Level", "Hi Cut", "Release", "Preset"})
+        for (const char *k : {"Disto", "Lo Cut", "Gate", "Level", "Hi Cut", "Release", "Preset", "Master", "Low", "Mono Bass", "Ceiling", "Lim Release"})
             CHECK(display(e2, k) == display(e, k), "chunk: %s %s vs %s", k, display(e2, k).c_str(), display(e, k).c_str());
         CHECK(std::fabs(e2->getParameter(e2, param(e2, "Hi Cut")) - 0.4321f) < 1e-4, "chunk loses knob resolution");
         std::printf("  chunk %ld bytes: %s, %s, %s, %s, %s, %s\n", (long)len, display(e2, "Disto").c_str(), display(e2, "Lo Cut").c_str(),
                     display(e2, "Gate").c_str(), display(e2, "Level").c_str(), display(e2, "Hi Cut").c_str(), display(e2, "Preset").c_str());
         e2->dispatcher(e2, 1, 0, 0, nullptr, 0);
+    }
+
+    /* 13. the MASTER page */
+    {
+        neutral(e); silence(e, 3.0);   /* let the compressor recover from the hot runs */
+        std::printf("  master: latency %d samples (%s / %s / %s / %s / %s / %s / %s), readouts %s, %s\n", LAT, display(e, "Master").c_str(),
+                    display(e, "Low").c_str(), display(e, "Mono Bass").c_str(), display(e, "Width").c_str(), display(e, "Push").c_str(),
+                    display(e, "Ceiling").c_str(), display(e, "Lim Release").c_str(), display(e, "Loudness").c_str(), display(e, "Gain Red").c_str());
+        CHECK(display(e, "Master") == "OFF" && display(e, "Ceiling") == "-1.0 dB" && display(e, "Lim Release") == "AUTO" &&
+              display(e, "Mono Bass") == "OFF" && display(e, "Gain Red") == "GR OFF", "master start readouts");
+        /* a. on, everything neutral, below the ceiling: the input comes back unchanged */
+        set(e, "Master", 1);
+        Buf a = run(e, 220, 0.3, 0.8);
+        double d = diff_delayed(a, g_in, LAT, 0.3);
+        std::printf("  master on, neutral: difference to the delayed input %.1f dB, %s\n", db(d / 0.3), display(e, "Gain Red").c_str());
+        CHECK(d < 1e-4, "master on (neutral) changes the signal");
+        CHECK(display(e, "Gain Red") == "GR 0.0 dB", "gain reduction readout %s", display(e, "Gain Red").c_str());
+        /* b. push 12 dB into a -1 dB ceiling: sample peak at the ceiling, never above */
+        const double c1 = std::pow(10.0, -1.0 / 20);
+        set(e, "Push", 12);
+        Buf b = run(e, 1000, 0.5, 1.0);
+        std::printf("  push +12, ceiling -1: peak %.4f (ceiling %.4f), rms %.1f dBFS, %s\n", peak(b, 0.1), c1, db(rms(b, 0.3)), display(e, "Gain Red").c_str());
+        CHECK(peak(b, 0.1) <= c1 * 1.0002 && peak(b, 0.3) > c1 * 0.97, "limiter does not hold the ceiling");
+        CHECK(num(display(e, "Gain Red")) < -3, "gain reduction readout %s", display(e, "Gain Red").c_str());
+        /* c. true peak: a tone near a quarter of the sample rate, where samples miss the crest */
+        Buf c = run(e, 11025 * 0.97, 0.5, 0.6);
+        double tp = true_peak(c, 0.3);
+        std::printf("  true peak at %.0f Hz: sample peak %.1f dB, true peak %.2f dB (ceiling -1.0)\n", 11025 * 0.97, db(peak(c, 0.3)), db(tp));
+        CHECK(db(tp) < -1.0 + 0.3, "true peak %.2f dB above the ceiling", db(tp));
+        /* d. a sudden burst after silence: the look-ahead catches its first wave */
+        set(e, "Push", 6);
+        silence(e, 0.6);
+        Buf dd = run(e, 200, 1.0, 0.2);
+        std::printf("  burst after silence: peak in the first 20 ms %.4f\n", peak(dd, 0, 0.02));
+        CHECK(peak(dd) <= c1 * 1.0002, "burst overshoots the ceiling (%.4f)", peak(dd));
+        /* e. ceiling -3 dB */
+        set(e, "Ceiling", -3);
+        Buf ee = run(e, 300, 0.9, 0.6);
+        std::printf("  ceiling %s: peak %.4f\n", display(e, "Ceiling").c_str(), peak(ee, 0.1));
+        CHECK(peak(ee, 0.1) <= std::pow(10.0, -3.0 / 20) * 1.0002, "ceiling -3 dB not held");
+        neutral(e); set(e, "Master", 1); silence(e, 1.0);
+        /* f. the shelves (low level, the limiter stays out of it) */
+        set(e, "Low", 6);
+        double l40 = db(rms(run(e, 40, 0.05, 0.8), 0.4) / rms(g_in, 0.4)), l2k = db(rms(run(e, 2000, 0.05, 0.5), 0.3) / rms(g_in, 0.3));
+        set(e, "Low", 0); set(e, "High", 6);
+        double h16 = db(rms(run(e, 16000, 0.05, 0.5), 0.3) / rms(g_in, 0.3)), h500 = db(rms(run(e, 500, 0.05, 0.5), 0.3) / rms(g_in, 0.3));
+        set(e, "High", -6);
+        double h16c = db(rms(run(e, 16000, 0.05, 0.5), 0.3) / rms(g_in, 0.3));
+        std::printf("  low +6: 40 Hz %+.1f dB, 2 kHz %+.2f dB; high +6: 16 kHz %+.1f dB, 500 Hz %+.2f dB; high -6: 16 kHz %+.1f dB\n", l40, l2k, h16, h500, h16c);
+        CHECK(l40 > 5 && l40 < 6.3 && std::fabs(l2k) < 0.3, "LOW shelf off");
+        CHECK(h16 > 5 && h16 < 6.3 && std::fabs(h500) < 0.3 && h16c < -5 && h16c > -6.3, "HIGH shelf off");
+        set(e, "High", 0);
+        /* g. mono bass at 120 Hz: a bass on the left only ends up in the middle, the treble stays left */
+        set(e, "Mono Bass", 59.95);
+        Buf L1; Buf R1 = run(e, 40, 0.2, 0.8, &L1, 0.2), dummy;
+        Buf L2; Buf R2 = run(e, 40, 0.0, 0.8, &L2, 0.2);
+        Buf L3; Buf R3 = run(e, 3000, 0.0, 0.6, &L3, 0.2);
+        std::printf("  mono bass %s: left-only 40 Hz -> left %.1f / right %.1f dBFS; left-only 3 kHz -> right %.1f dBFS\n",
+                    display(e, "Mono Bass").c_str(), db(rms(L2, 0.4)), db(rms(R2, 0.4)), db(rms(R3, 0.3)));
+        CHECK(display(e, "Mono Bass") == "120 Hz", "mono bass readout %s", display(e, "Mono Bass").c_str());
+        CHECK(std::fabs(db(rms(L2, 0.4)) - db(rms(R2, 0.4))) < 0.5, "MONO BASS does not centre the bass");
+        CHECK(rms(R3, 0.3) < 0.003 * rms(L3, 0.3), "MONO BASS touches the treble");
+        set(e, "Mono Bass", 0);
+        /* h. width */
+        set(e, "Width", 0);
+        Buf L4; Buf R4 = run(e, 1000, 0.0, 0.5, &L4, 0.2);
+        set(e, "Width", 200);
+        Buf L5; Buf R5 = run(e, 1000, 0.0, 0.5, &L5, 0.2);
+        std::printf("  width 0: left-only -> L %.3f R %.3f; width 200: L %.3f R %.3f (rms)\n", rms(L4, 0.3), rms(R4, 0.3), rms(L5, 0.3), rms(R5, 0.3));
+        CHECK(std::fabs(rms(L4, 0.3) - rms(R4, 0.3)) < 1e-3, "WIDTH 0 is not mono");
+        CHECK(std::fabs(rms(L5, 0.3) / rms(R5, 0.3) - 3.0) < 0.05, "WIDTH 200 is not twice the side");
+        set(e, "Width", 100);
+        /* i. loudness readout: a 1 kHz tone at -20 dBFS on both channels reads about -20.7 LUFS */
+        run(e, 1000, 0.1, 3.5);
+        double lu = num(display(e, "Loudness"));
+        std::printf("  loudness of -20 dBFS 1 kHz stereo: %s (BS.1770: -20.0)\n", display(e, "Loudness").c_str());
+        CHECK(std::fabs(lu + 20.0) < 0.3, "loudness readout %s", display(e, "Loudness").c_str());
+        silence(e, 3.5);
+        CHECK(display(e, "Loudness") == "-- LUFS", "loudness of silence %s", display(e, "Loudness").c_str());
+        /* j. release: after a loud tone, a quiet one comes back sooner with AUTO than with 1 s */
+        double rr[2];
+        set(e, "Push", 12);
+        for (int j = 0; j < 2; j++) {
+            set(e, "Lim Release", j ? 100 : 0); silence(e, 1.0);
+            run(e, 1000, 0.5, 0.15);
+            Buf q = run(e, 1000, 0.02, 1.5);
+            rr[j] = rms(q, 0.05, 0.15) / rms(q, 1.3);
+        }
+        std::printf("  limiter release: quiet tone 50..150 ms after a short loud one at %+.1f dB (AUTO) vs %+.1f dB (%s)\n", db(rr[0]), db(rr[1]),
+                    display(e, "Lim Release").c_str());
+        CHECK(rr[0] > rr[1] * 1.5, "RELEASE does not change the limiter's recovery");
+        /* k. off again: the signal is unchanged, the latency the same */
+        set(e, "Lim Release", 0);
+        set(e, "Master", 0);
+        Buf k = run(e, 220, 0.3, 0.8);
+        double dk = diff_delayed(k, g_in, LAT, 0.3);
+        std::printf("  master off again: difference to the delayed input %.1f dB, %s\n", db(dk / 0.3), display(e, "Gain Red").c_str());
+        CHECK(dk < 0.5e-3 && display(e, "Gain Red") == "GR OFF", "master off does not bypass");
+        /* l. hot input with everything up and the master on: below the ceiling */
+        set(e, "In Gain", 24); set(e, "Drive", 100); set(e, "Level", 12); set(e, "Comp", 30);
+        set(e, "Master", 1); set(e, "Low", 6); set(e, "High", 6); set(e, "Width", 200); set(e, "Push", 12); set(e, "Ceiling", -0.1);
+        double hp = peak(run(e, 110, 1.0, 1.0), 0.1);
+        std::printf("  hot with master (ceiling -0.1): peak %.4f\n", hp);
+        CHECK(hp <= std::pow(10.0, -0.1 / 20) * 1.0002, "hot input above the ceiling");
+        neutral(e); silence(e, 0.5);
     }
 
     /* 12. stress: random parameters (LOAD/SAVE included) on a loud tone; 44.1, 48 and 96 kHz */

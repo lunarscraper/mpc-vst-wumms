@@ -2,8 +2,10 @@
  * wumms_vst.cpp - Wumms: an end-of-chain warming unit in the manner of the OTO Boum as a VST2
  * insert effect for the MPC OS plugin host (Force, MPC Live/One/X/Key), armhf. The DSP is
  * wumms_core.h: in gain, gate, one-knob compressor, low cut, four distortion types, high cut,
- * dry/wet mix, level. This file is the plug-in around it: the shell of mpc-vst-vfilter
- * (hand-written, no wrapper, no SDK) with the 32 preset slots and LOAD/SAVE of mpc-vst-rattler.
+ * dry/wet mix, level. Behind it the MASTER page, wumms_master.h: low and high shelf, mono bass,
+ * width, a look-ahead true-peak limiter and the loudness/gain-reduction readouts; off by default.
+ * This file is the plug-in around them: the shell of mpc-vst-vfilter (hand-written, no wrapper,
+ * no SDK) with the 32 preset slots and LOAD/SAVE of mpc-vst-rattler.
  * MIT license (see ../LICENSE). "OTO" and "Boum" belong to their owners; no affiliation.
  * ========================================================================== */
 #include <algorithm>
@@ -20,6 +22,7 @@
 #include "params.h"
 #include "popup.h"    /* mpc-vst-plugins wrapper/popup.h, copied into build/ by build.sh */
 #include "wumms_core.h"
+#include "wumms_master.h"
 
 /* ---- VST2 ABI (hand-written; no Steinberg SDK) ---------------------------- */
 struct AEffect;
@@ -65,15 +68,18 @@ typedef struct {
 enum { effFlagsCanReplacing = 1 << 4, effFlagsProgramChunks = 1 << 5, effFlagsIsSynth = 1 << 8 };
 
 /* the parameters, by key (module.json); IDX[] is their position in the generated PARAMS[] */
-enum { GAIN, COMP, ATTACK, RELEASE, DRIVE, DISTO, MIX, LEVEL, LOCUT, HICUT, GATE, SLOT, LOAD, SAVE, NKEYS };
+enum { GAIN, COMP, ATTACK, RELEASE, DRIVE, DISTO, MIX, LEVEL, LOCUT, HICUT, GATE, SLOT, LOAD, SAVE,
+       MASTER, M_LOW, M_HIGH, M_MONO, M_WIDTH, M_PUSH, M_CEIL, M_REL, LUFS, GR, NKEYS };
 static const char *const KEYS[NKEYS] = {
     "gain", "comp", "attack", "release", "drive", "disto", "mix", "level", "locut", "hicut", "gate",
     "slot", "load", "save",
+    "master", "m_low", "m_high", "m_mono", "m_width", "m_push", "m_ceil", "m_release", "lufs", "gr",
 };
 static int IDX[NKEYS];
 static int KEY_OF[NPARAMS];   /* PARAMS[] position -> key enum, -1 = not ours */
-/* slot, load and save belong to the preset bank: never part of a chunk or a preset */
-static bool is_bank_key(int i) { const int k = KEY_OF[i]; return k == SLOT || k == LOAD || k == SAVE; }
+/* slot, load and save belong to the preset bank, lufs and gr are readouts the plugin writes:
+ * never part of a chunk or a preset, never automated */
+static bool is_bank_key(int i) { const int k = KEY_OF[i]; return k == SLOT || k == LOAD || k == SAVE || k == LUFS || k == GR; }
 
 struct Plugin {
     AEffect fx;
@@ -87,6 +93,11 @@ struct Plugin {
     std::atomic<int> cur{0};        /* selected preset slot, 0-based */
     wumms::Engine engine;
     wumms::Params p;
+    wumms::Master mst;              /* the MASTER page */
+    wumms::MasterParams mp;
+    std::atomic<float> lufs{-100.0f}, gr{0.0f};   /* for the readouts (MPC polls their text) */
+    std::atomic<bool> mstOn{false};
+    float grShown = 0.0f;
     float sr = 44100;
     std::vector<uint8_t> chunk;
 };
@@ -142,6 +153,8 @@ struct NoDenormals {
 static float law_attack_ms(float x) { return 0.05f * std::pow(660.0f, x); }    /* 50 us .. 33 ms */
 static float law_release_ms(float x) { return 50.0f * std::pow(20.0f, x); }    /* 50 ms .. 1 s */
 static const float LOCUT_HZ[4] = {0.0f, 75.0f, 150.0f, 300.0f};
+static float law_mono_hz(float x) { return 40.0f * std::pow(6.25f, x); }      /* 40 .. 250 Hz, 0 = OFF */
+static float law_lim_release_ms(float x) { return 10.0f * std::pow(100.0f, x); }   /* 10 ms .. 1 s, 0 = AUTO */
 
 static void configure(Plugin *w) {
     wumms::Params &p = w->p;
@@ -157,6 +170,18 @@ static void configure(Plugin *w) {
     p.hicut = pct(w, HICUT);
     const int g = clampi((int)val(w, GATE), 0, 6);
     p.gateDb = g ? -60.0f + 10.0f * g : -100.0f;      /* OFF, -50 .. 0 dB in 10 dB steps */
+    wumms::MasterParams &m = w->mp;
+    m.on = val(w, MASTER) >= 1.0f;
+    m.lowDb = val(w, M_LOW);
+    m.highDb = val(w, M_HIGH);
+    const float mono = pct(w, M_MONO);
+    m.monoHz = mono < 0.005f ? 0.0f : law_mono_hz(mono);
+    m.width = val(w, M_WIDTH) * 0.01f;
+    m.pushDb = val(w, M_PUSH);
+    m.ceilDb = val(w, M_CEIL);
+    const float rel = pct(w, M_REL);
+    m.releaseMs = rel < 0.005f ? 0.0f : law_lim_release_ms(rel);
+    w->mstOn.store(m.on);
 }
 
 /* the start setting: everything neutral, the signal passes unchanged (slot 1, CLEAN) */
@@ -164,6 +189,9 @@ static void start_values(Plugin *w) {
     start(w, GAIN, 0); start(w, COMP, 0); start(w, ATTACK, 60); start(w, RELEASE, 45);
     start(w, DRIVE, 0); start(w, DISTO, 0); start(w, MIX, 100); start(w, LEVEL, 0);
     start(w, LOCUT, 0); start(w, HICUT, 100); start(w, GATE, 0);
+    /* MASTER page: off, and neutral when switched on (only the limiter at -1 dB works then) */
+    start(w, MASTER, 0); start(w, M_LOW, 0); start(w, M_HIGH, 0); start(w, M_MONO, 0); start(w, M_WIDTH, 100);
+    start(w, M_PUSH, 0); start(w, M_CEIL, -1); start(w, M_REL, 0);
 }
 
 /* ---- state as text: "key=value;" for every parameter of the sound. Used for the project chunk
@@ -230,6 +258,21 @@ static const struct { const char *name, *state; } FACTORY[] = {
     {"LOFI RADIO", "comp=35;attack=40;release=40;drive=40;disto=1;locut=3;hicut=68;level=2;"},
     {"GATED DRIVE", "gain=3;comp=28;attack=60;release=25;drive=35;disto=0;gate=3;level=-3;"},
     {"DRUM CRUNCH", "gain=4;comp=36;attack=72;release=20;drive=38;disto=2;hicut=88;mix=60;"},
+    /* 17-24: with the MASTER page on (m_mono 38/50/60/68 = 80/100/120/140 Hz; m_release 0 = AUTO) */
+    {"MASTER SAFE", "master=1;m_ceil=-1;"},
+    {"MASTER LOUD", "comp=14;attack=62;release=45;master=1;m_mono=50;m_push=6;m_ceil=-1;"},
+    {"GOA MASTER", "gain=1;comp=20;attack=70;release=30;drive=10;disto=1;hicut=97;level=-2;"
+                   "master=1;m_low=1;m_high=1.5;m_mono=60;m_width=110;m_push=6;m_ceil=-1;"},
+    {"TECHNO MASTER", "gain=2;comp=24;attack=78;release=22;drive=12;disto=0;level=-2;"
+                      "master=1;m_low=1.5;m_high=0.5;m_mono=50;m_push=7;m_ceil=-0.8;"},
+    {"WARM MASTER", "comp=14;attack=60;release=50;drive=22;disto=1;hicut=93;level=-2;"
+                    "master=1;m_low=1.5;m_high=-0.5;m_mono=68;m_width=95;m_push=5;m_ceil=-1;"},
+    {"BRIGHT MASTER", "comp=12;attack=65;release=40;drive=6;"
+                      "master=1;m_low=0.5;m_high=3;m_mono=50;m_width=115;m_push=6;m_ceil=-1;"},
+    {"AMBIENT MASTER", "comp=8;attack=80;release=70;"
+                       "master=1;m_low=0.5;m_high=1.5;m_mono=38;m_width=135;m_push=3;m_ceil=-1.5;m_release=80;"},
+    {"LIVE CLUB", "gain=2;comp=26;attack=72;release=25;drive=16;disto=0;level=-3;"
+                  "master=1;m_low=1;m_high=1;m_mono=60;m_push=9;m_ceil=-0.5;m_release=30;"},
 };
 enum { NFACTORY = (int)(sizeof FACTORY / sizeof FACTORY[0]) };
 
@@ -327,16 +370,31 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
     Plugin *w = (Plugin *)e->object;
     NoDenormals nd;
     if (w->dirty.exchange(false)) configure(w);
-    if (n > 0) w->engine.process(w->p, in[0], in[1], out[0], out[1], (uint32_t)n);
+    if (n > 0) {
+        w->engine.process(w->p, in[0], in[1], out[0], out[1], (uint32_t)n);
+        w->mst.process(w->mp, out[0], out[1], (uint32_t)n);
+    }
+    const bool limited = w->mp.on || w->mst.active();
     for (int c = 0; c < 2; c++) {
         float *y = out[c];
         for (int i = 0; i < n; i++) {
+            if (limited) {   /* the limiter keeps the ceiling; this only catches what must never happen */
+                y[i] = std::min(0.99f, std::max(-0.99f, y[i]));
+                continue;
+            }
             const float a = std::fabs(y[i]);              /* output safety above -1.4 dBFS, ceiling 0.99 */
             if (a > 0.85f) {
                 float t = std::min((a - 0.85f) / 0.14f, 3.0f), t2 = t * t;
                 y[i] = std::copysign(0.85f + 0.14f * t * (27 + t2) / (27 + 9 * t2), y[i]);
             }
         }
+    }
+    /* readouts: loudness as measured, gain reduction held so it can be read (falls 10 dB/s) */
+    if (n > 0) {
+        const float g = w->mst.gain_reduction_db();
+        w->grShown = g < w->grShown ? g : std::min(0.0f, w->grShown + 10.0f * n / w->sr);
+        w->gr.store(w->grShown);
+        w->lufs.store(w->mst.loudness_lufs());
     }
     bool any = false;
     for (int i = 0; i < NPARAMS; i++) {
@@ -359,6 +417,7 @@ static void setParameter(AEffect *e, int32_t i, float n) {
         if (v != w->cur.load()) { w->cur.store(v); w->master(&w->fx, audioMasterUpdateDisplay, 0, 0, 0, 0.0f); }
         return;
     }
+    if (key == LUFS || key == GR) return;   /* readouts: the plugin writes them */
     if (key == LOAD || key == SAVE) {
         const bool down = n > 0.5f;
         const bool rising = down && !w->down[i];   /* an echo of our own automate must not fire again */
@@ -388,7 +447,7 @@ static float getParameter(AEffect *e, int32_t i) {
     if (i < 0 || i >= NPARAMS) return 0.0f;
     const int key = KEY_OF[i];
     if (key == SLOT) return (float)w->cur.load() / (NSLOTS - 1);
-    if (key == LOAD || key == SAVE) return 0.0f;   /* triggers always read released */
+    if (key == LOAD || key == SAVE || key == LUFS || key == GR) return 0.0f;   /* triggers read released */
     if (popup_is(i)) return w->open[i];
     return w->cache[i].load();
 }
@@ -417,6 +476,19 @@ static void display(Plugin *w, int idx, char *buf, size_t n) {
     const int key = KEY_OF[idx];
     if (key == SLOT) { std::snprintf(buf, n, "%s", slot_title(clampi(w->cur.load(), 0, NSLOTS - 1)).c_str()); return; }
     if (key == LOAD || key == SAVE) { buf[0] = 0; return; }
+    if (key == LUFS) {
+        const float l = w->lufs.load();
+        if (l < -70.0f) std::snprintf(buf, n, "-- LUFS"); else std::snprintf(buf, n, "%.1f LUFS", l);
+        return;
+    }
+    if (key == GR) {
+        if (!w->mstOn.load()) std::snprintf(buf, n, "GR OFF");
+        else {
+            const float g = w->gr.load();
+            std::snprintf(buf, n, "GR %.1f dB", g > -0.05f ? 0.0f : g);
+        }
+        return;
+    }
     if (popup_is(idx)) {
         const int u = norm_to_ui(pp, w->open[idx]);
         if (pp->nopts) std::snprintf(buf, n, "%s", pp->opts[u]); else std::snprintf(buf, n, "%d", u);
@@ -427,7 +499,14 @@ static void display(Plugin *w, int idx, char *buf, size_t n) {
     const float v = val_at(w, idx);
     const float x = (v - pp->min) / (pp->max > pp->min ? pp->max - pp->min : 1);
     switch (key) {
-    case GAIN: case LEVEL: std::snprintf(buf, n, "%+.1f dB", v); break;
+    case GAIN: case LEVEL: case M_LOW: case M_HIGH: case M_PUSH: std::snprintf(buf, n, "%+.1f dB", v); break;
+    case M_CEIL: std::snprintf(buf, n, "%.1f dB", v); break;
+    case M_MONO:
+        if (x < 0.005f) std::snprintf(buf, n, "OFF"); else std::snprintf(buf, n, "%d Hz", (int)std::lround(law_mono_hz(x)));
+        break;
+    case M_REL:
+        if (x < 0.005f) std::snprintf(buf, n, "AUTO"); else std::snprintf(buf, n, "%d ms", (int)std::lround(law_lim_release_ms(x)));
+        break;
     case COMP: {   /* the one knob as the ratio it stands for */
         const float s = wumms::comp_slope(x);
         if (s < 0.005f) std::snprintf(buf, n, "OFF");
@@ -498,7 +577,7 @@ static intptr_t dispatcher(AEffect *e, int32_t op, int32_t idx, intptr_t v, void
         return 1;
     }
     case effSetSampleRate:
-        if (o > 0) { w->sr = o; w->engine.init(o); w->dirty.store(true); }
+        if (o > 0) { w->sr = o; w->engine.init(o); w->mst.init(o); w->dirty.store(true); }
         return 1;
     case effSetBlockSize: case effMainsChanged: return 1;
     case effCanDo: return -1;
@@ -520,6 +599,7 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     for (int i = 0; i < NPARAMS; i++) { w->cache[i].store(PARAMS[i].def); w->notify[i].store(0); }
     start_values(w);
     w->engine.init(w->sr);
+    w->mst.init(w->sr);
     AEffect *e = &w->fx;
     std::memset(e, 0, sizeof *e);
     e->magic = 0x56737450;
@@ -531,7 +611,7 @@ extern "C" __attribute__((visibility("default"))) AEffect *VSTPluginMain(audioMa
     e->numPrograms = NSLOTS;
     e->numInputs = 2;
     e->numOutputs = 2;
-    e->initialDelay = wumms::LATENCY;   /* the 2x oversampling's filters */
+    e->initialDelay = wumms::LATENCY + wumms::Master::LOOK;   /* 2x oversampling + the limiter's look-ahead, always */
     e->flags = effFlagsCanReplacing | effFlagsProgramChunks;
     e->uniqueID = PLUG_UID;
     e->version = PLUG_VERSION;
