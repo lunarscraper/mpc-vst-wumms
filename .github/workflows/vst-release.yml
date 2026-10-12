@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version, e.g. 0.1.0
+        description: Version, e.g. 0.2.0
         required: true
-        default: 0.1.0
+        default: 0.2.0
       dry_run:
         description: Build only (zip + skin previews as run artifacts), no draft release
         type: boolean
@@ -26,5 +26,5 @@ jobs:
       host_test: bash vst/test.sh
       plugin_id: wumms
       license: MIT
-      about: Wumms (insert effect) - end-of-chain warming unit in the manner of the OTO Boum - gate, one-knob compressor, low cut, four distortion types, high cut, dry/wet mix; 32 preset slots with LOAD/SAVE.
+      about: Wumms (insert effect) - end-of-chain warming unit in the manner of the OTO Boum - gate, one-knob compressor, low cut, four distortion types, high cut, dry/wet mix; switchable MASTER page (shelves, mono bass, width, true-peak limiter, LUFS and gain-reduction readouts); 32 preset slots with LOAD/SAVE.
       dry_run: ${{ inputs.dry_run }}
