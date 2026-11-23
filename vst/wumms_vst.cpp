@@ -398,7 +398,9 @@ static void processReplacing(AEffect *e, float **in, float **out, int32_t n) {
     }
     bool any = false;
     for (int i = 0; i < NPARAMS; i++) {
-        if (w->release[i]) { w->release[i] = 0; any = true; w->master(&w->fx, audioMasterAutomate, i, 0, 0, 0.0f); }
+        /* LOAD/SAVE report their release and are ready for the next tap (0.2.1): MPC OS 3.10 sends a tap as a 1
+         * with no 0 after it, so waiting for the host's 0 left both buttons dead after their first press */
+        if (w->release[i]) { w->release[i] = 0; w->down[i] = false; any = true; w->master(&w->fx, audioMasterAutomate, i, 0, 0, 0.0f); }
         if (!w->notify[i].exchange(0)) continue;
         any = true;
         w->master(&w->fx, audioMasterAutomate, i, 0, 0, w->cache[i].load());

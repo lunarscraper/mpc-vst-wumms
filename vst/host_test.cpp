@@ -368,6 +368,13 @@ int main(int argc, char **argv) {
         press(e, "Load");
         CHECK(display(e, "Disto") == "FUZZ" && display(e, "Lo Cut") == "300 HZ" && std::fabs(e->getParameter(e, param(e, "Comp")) - 0.375f) < 1e-4, "LOAD does not restore the saved setting");
         CHECK(e->getParameter(e, param(e, "Load")) == 0 && e->getParameter(e, param(e, "Save")) == 0, "buttons do not read released");
+        /* 0.2.1: MPC OS 3.10 sends a tap as a 1 with no 0 after it - every tap must still load */
+        set(e, "Disto", 0);
+        e->setParameter(e, param(e, "Load"), 1.0f); silence(e, 0.01);
+        CHECK(display(e, "Disto") == "FUZZ", "Force tap 1 does not load");
+        set(e, "Disto", 0);
+        e->setParameter(e, param(e, "Load"), 1.0f); silence(e, 0.01);
+        CHECK(display(e, "Disto") == "FUZZ", "Force tap 2 does not load (button dead after the first press)");
         /* LOAD on an empty slot leaves the setting alone */
         set(e, "Preset", 30); press(e, "Load");
         CHECK(display(e, "Disto") == "FUZZ", "empty slot wiped the setting");

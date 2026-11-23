@@ -7,8 +7,19 @@ Dazu eine zuschaltbare **MASTER-Seite** (EQ, Mono-Bass, Stereobreite, True-Peak-
 und Limiter-Anzeige), mit der sich auf der Force ein fertiges Master machen lässt, ohne Umweg über
 den PC.
 
-**Status:** Version 0.2.0 (MASTER-Seite neu). Offline-Test (`vst/test.sh`) besteht, Actions-Build
+**Status:** Version 0.3.0 (Force-Look). 0.2.1: LOAD/SAVE reagieren unter MPC OS 3.10 auf jeden Tipp, nicht nur auf den ersten. 0.2.0: MASTER-Seite neu. Offline-Test (`vst/test.sh`) besteht, Actions-Build
 und Test auf der Force stehen aus.
+
+## Force-Look (Version 0.3.0)
+
+Neuer Skin wie bei Rattler 1.1 und Fader FX 1.2: große Schrift, große Bedienflächen und eine eigene, bunte Seite
+(Bernstein und Gold auf dunklem Braun). Jede Seite hat oben links ihren Namen und darunter zwei Felder mit den Bedienelementen; MASTER zeigt Lautheit und Limiter in einem eigenen Feld, OFF | ON als große Felder; PRESET hat große LOAD- und SAVE-Tasten. Seiten,
+Parameter, Q-Links, CCs, Presets und gespeicherte Projekte bleiben unverändert.
+
+Technik: `vst/force_look.py` (aus Rattler übernommen) läuft als `skin_post` von `gen_vst.py` und malt die Bilder des
+Generators neu; die Zeilen `#@look`, `#@title`, `#@frame`, `#@text` in `layout.conf` zeichnet es dazu. Der Workflow
+nutzt dafür open-mpc/mpc-vst-plugins Stand 1af05b9 (wie Rattler; installiert nach „VST2 Plugins“ ab MPC OS 3.10.1).
+Nach dem Installieren die Force einmal neu starten: MPC lädt einen geänderten Skin erst nach einem Neustart.
 
 ## Abgrenzung
 
